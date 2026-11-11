@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Interval } from '@nestjs/schedule';
 import { CdrReaderService } from './cdr-reader.service';
-import { SyncStateService } from './sync-state.service';
+import { SyncState, SyncStateService } from './sync-state.service';
 import { VpsClientService } from './vps-client.service';
 import { RecordingFetcherService } from './recording-fetcher.service';
 import { CdrRow } from './cdr.types';
@@ -56,6 +56,8 @@ export class SyncSchedulerService {
 
   async syncOnce(): Promise<void> {
     const state = await this.syncState.loadOrInit();
+    await this.retryPending(state);
+
     const all = await this.cdrReader.readMaster();
     const batchSize = Number(this.config.get('BATCH_SIZE')) || 200;
 
@@ -65,7 +67,8 @@ export class SyncSchedulerService {
       return;
     }
 
-    // Process in batches; advance cursor only after successful full batch handling
+    // Cursor moves only after the CDR batch is accepted by the VPS.
+    // A failed mp3 stays in pendingRecordings and is retried later.
     for (let i = 0; i < fresh.length; i += batchSize) {
       const batch = fresh.slice(i, i + batchSize);
       await this.vpsClient.ingestCalls(batch);
@@ -74,17 +77,9 @@ export class SyncSchedulerService {
         if (!row.userfield) {
           continue;
         }
-        const buffer = await this.recordingFetcher.fetch(row.userfield);
-        if (!buffer) {
-          this.logger.warn(`No recording for userfield=${row.userfield}`);
-          continue;
-        }
-        try {
-          await this.vpsClient.ingestRecording(row.userfield, buffer);
-        } catch (err) {
-          this.logger.warn(
-            `Recording upload failed for ${row.userfield}: ${(err as Error).message}`,
-          );
+        const stored = await this.uploadRecording(row.userfield);
+        if (!stored) {
+          this.enqueuePending(state, row.userfield);
         }
       }
 
@@ -92,6 +87,63 @@ export class SyncSchedulerService {
       await this.syncState.save(state);
       this.logger.log(`Synced batch of ${batch.length} calls`);
     }
+  }
+
+  private async retryPending(state: SyncState): Promise<void> {
+    const pending = state.pendingRecordings || [];
+    if (!pending.length) {
+      return;
+    }
+
+    const still: SyncState['pendingRecordings'] = [];
+    for (const item of pending) {
+      const stored = await this.uploadRecording(item.userfield);
+      if (stored) {
+        this.logger.log(`Recording stored on retry: ${item.userfield}`);
+        continue;
+      }
+      const attempts = item.attempts + 1;
+      if (attempts >= 20) {
+        this.logger.warn(
+          `Stopped retrying recording ${item.userfield} after ${attempts} attempts`,
+        );
+        continue;
+      }
+      still.push({ userfield: item.userfield, attempts });
+    }
+
+    state.pendingRecordings = still;
+    await this.syncState.save(state);
+  }
+
+  private async uploadRecording(userfield: string): Promise<boolean> {
+    const buffer = await this.recordingFetcher.fetch(userfield);
+    if (!buffer) {
+      this.logger.warn(`No recording for userfield=${userfield}`);
+      return false;
+    }
+    try {
+      await this.vpsClient.ingestRecording(userfield, buffer);
+      return true;
+    } catch (err) {
+      this.logger.warn(
+        `Recording upload failed for ${userfield}: ${(err as Error).message}`,
+      );
+      return false;
+    }
+  }
+
+  private enqueuePending(state: SyncState, userfield: string): void {
+    if (!state.pendingRecordings) {
+      state.pendingRecordings = [];
+    }
+    const exists = state.pendingRecordings.some(
+      (item) => item.userfield === userfield,
+    );
+    if (exists) {
+      return;
+    }
+    state.pendingRecordings.push({ userfield, attempts: 1 });
   }
 
   private isNewer(

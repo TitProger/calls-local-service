@@ -11,6 +11,57 @@ export class CdrReaderService {
   constructor(private readonly config: ConfigService) {}
 
   async readMaster(): Promise<CdrRow[]> {
+    const httpBase = (this.config.get<string>('CDR_HTTP_BASE') || '').trim();
+    if (httpBase) {
+      return this.readFromHttp(httpBase);
+    }
+    return this.readFromFile();
+  }
+
+  private async readFromHttp(base: string): Promise<CdrRow[]> {
+    const root = base.replace(/\/$/, '');
+    const files = [this.yesterdayFileName(), 'Master.csv'];
+    const byId = new Map<string, CdrRow>();
+
+    for (const file of files) {
+      const url = `${root}/cdr/${encodeURIComponent(file)}`;
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+        if (!res.ok) {
+          this.logger.warn(`CDR HTTP ${res.status}: ${url}`);
+          continue;
+        }
+        const body = (await res.json()) as { cdr?: unknown };
+        const list = Array.isArray(body?.cdr) ? body.cdr : [];
+        let added = 0;
+        for (const item of list) {
+          if (!item || typeof item !== 'object') {
+            continue;
+          }
+          const row = this.mapRow(item as Record<string, unknown>);
+          if (!row) {
+            continue;
+          }
+          byId.set(row.uniqueid, row);
+          added += 1;
+        }
+        this.logger.log(`CDR HTTP ${file}: ${added} rows`);
+      } catch (err) {
+        this.logger.warn(`CDR HTTP failed: ${url} (${(err as Error).message})`);
+      }
+    }
+
+    return [...byId.values()];
+  }
+
+  private yesterdayFileName(now = new Date()): string {
+    const day = new Date(now.getTime());
+    day.setDate(day.getDate() - 1);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `cdr-${day.getFullYear()}${pad(day.getMonth() + 1)}${pad(day.getDate())}.csv`;
+  }
+
+  private async readFromFile(): Promise<CdrRow[]> {
     const filePath =
       this.config.get<string>('CDR_MASTER_PATH') ||
       '/var/log/asterisk/cdr-custom/Master.csv';
@@ -35,31 +86,10 @@ export class CdrReaderService {
       );
 
       parser.on('data', (raw: Record<string, string>) => {
-        if (!raw.uniqueid) {
-          return;
+        const row = this.mapRow(raw);
+        if (row) {
+          rows.push(row);
         }
-        rows.push({
-          uniqueid: raw.uniqueid,
-          sequence: raw.sequence || undefined,
-          clid: raw.clid || undefined,
-          src: raw.src || undefined,
-          dst: raw.dst || undefined,
-          dstf: raw.dstf || undefined,
-          dcontext: raw.dcontext || undefined,
-          channel: raw.channel || undefined,
-          dstchannel: raw.dstchannel || undefined,
-          lastapp: raw.lastapp || undefined,
-          lastdata: raw.lastdata || undefined,
-          start: raw.start || undefined,
-          answer: raw.answer || undefined,
-          end: raw.end || undefined,
-          duration: this.toNumber(raw.duration),
-          billsec: this.toNumber(raw.billsec),
-          disposition: raw.disposition || undefined,
-          amaflags: raw.amaflags || undefined,
-          accountcode: raw.accountcode || undefined,
-          userfield: raw.userfield || undefined,
-        });
       });
 
       parser.on('error', reject);
@@ -69,8 +99,45 @@ export class CdrReaderService {
     return rows;
   }
 
-  private toNumber(value?: string): number | undefined {
-    if (value === undefined || value === '') {
+  private mapRow(raw: Record<string, unknown>): CdrRow | null {
+    const uniqueid = this.text(raw.uniqueid);
+    if (!uniqueid) {
+      return null;
+    }
+    return {
+      uniqueid,
+      sequence: this.text(raw.sequence),
+      clid: this.text(raw.clid),
+      src: this.text(raw.src),
+      dst: this.text(raw.dst),
+      dstf: this.text(raw.dstf),
+      dcontext: this.text(raw.dcontext),
+      channel: this.text(raw.channel),
+      dstchannel: this.text(raw.dstchannel),
+      lastapp: this.text(raw.lastapp),
+      lastdata: this.text(raw.lastdata),
+      start: this.text(raw.start),
+      answer: this.text(raw.answer),
+      end: this.text(raw.end),
+      duration: this.toNumber(raw.duration),
+      billsec: this.toNumber(raw.billsec),
+      disposition: this.text(raw.disposition),
+      amaflags: this.text(raw.amaflags),
+      accountcode: this.text(raw.accountcode),
+      userfield: this.text(raw.userfield),
+    };
+  }
+
+  private text(value: unknown): string | undefined {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+    const text = String(value).trim();
+    return text || undefined;
+  }
+
+  private toNumber(value: unknown): number | undefined {
+    if (value === undefined || value === null || value === '') {
       return undefined;
     }
     const n = Number(value);

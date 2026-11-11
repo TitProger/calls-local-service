@@ -3,11 +3,18 @@ import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
 
+export interface PendingRecording {
+  userfield: string;
+  attempts: number;
+}
+
 export interface SyncState {
   /** ISO-like datetime string comparable with CDR start field "YYYY-MM-DD HH:mm:ss" */
   lastStart: string;
   lastUniqueIds: string[];
   initializedAt: string;
+  /** Recordings that were not uploaded yet. Retried without creating a second call row. */
+  pendingRecordings: PendingRecording[];
 }
 
 @Injectable()
@@ -23,13 +30,21 @@ export class SyncStateService {
   async loadOrInit(): Promise<SyncState> {
     try {
       const raw = await fs.promises.readFile(this.statePath, 'utf8');
-      return JSON.parse(raw) as SyncState;
+      const state = JSON.parse(raw) as SyncState;
+      if (!Array.isArray(state.pendingRecordings)) {
+        state.pendingRecordings = [];
+      }
+      if (!Array.isArray(state.lastUniqueIds)) {
+        state.lastUniqueIds = [];
+      }
+      return state;
     } catch {
       const now = this.formatNow();
       const state: SyncState = {
         lastStart: now,
         lastUniqueIds: [],
         initializedAt: new Date().toISOString(),
+        pendingRecordings: [],
       };
       await this.save(state);
       this.logger.log(
